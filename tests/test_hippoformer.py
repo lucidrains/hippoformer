@@ -69,7 +69,7 @@ def test_mm_tem(
 def test_tem_t():
     from hippoformer.hippoformer import TEMTransformerBlock
 
-    block = TEMTransformerBlock(32, 16)
+    block = TEMTransformerBlock(32, 16, window_size = 3)
 
     structural_codes = torch.randn(1, 7, 32)
     encoded_sensory = torch.randn(1, 7, 16)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import nn, Tensor, cat, stack, zeros_like, einsum, tensor
+from torch import nn, Tensor, cat, stack, arange, zeros_like, einsum, tensor
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.jit import ScriptModule, script_method
@@ -241,8 +241,9 @@ class Attention(Module):
         self,
         dim_q,
         dim_kv,
+        window_size,
         dim_head = 64,
-        heads = 8
+        heads = 8,
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -253,6 +254,8 @@ class Attention(Module):
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.window_size = window_size
 
         self.to_out = nn.Linear(dim_inner, dim_q, bias = False)
         self.attn_head_sink = nn.Parameter(torch.randn(heads) * 1e-2) # needed as the diagonal is masked out, and for attention sink
@@ -283,9 +286,13 @@ class Attention(Module):
         # the diagonal is masked out
 
         i, j = sim.shape[-2:]
-        causal_mask_without_diagonal = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i)
 
-        sim = sim.masked_fill(causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
+        j_seq = arange(j, device = device)[:, None]
+        i_seq = arange(i, device = device)[None, :] + (j - i)
+
+        windowed_causal_mask_without_diagonal = (i_seq > j_seq) & ((i_seq - j_seq) <= self.window_size)
+
+        sim = sim.masked_fill(windowed_causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
 
         # attention sink, for token as well as for attention sinking - from gpt-oss
 
@@ -317,7 +324,7 @@ class TEMTransformerBlock(Module):
     ):
         super().__init__()
 
-        self.attn = Attention(dim_structure, dim_structure + dim_encoded_sensory, dim_head = dim_head, heads = heads)
+        self.attn = Attention(dim_structure, dim_structure + dim_encoded_sensory, window_size, dim_head = dim_head, heads = heads)
         self.ff = FeedForward(dim_structure, ff_expansion_factor)
 
         self.window_size = window_size
