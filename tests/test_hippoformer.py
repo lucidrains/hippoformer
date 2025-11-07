@@ -65,3 +65,15 @@ def test_mm_tem(
 
     loss = model(sensory, actions, memory_mlp_params = next_params)
     loss.backward()
+
+def test_tem_t():
+    from hippoformer.hippoformer import TEMTransformerBlock
+
+    block = TEMTransformerBlock(32, 16)
+
+    structural_codes = torch.randn(1, 7, 32)
+    encoded_sensory = torch.randn(1, 7, 16)
+
+    pred, kv_cache = block(structural_codes, encoded_sensory)
+
+    assert pred.shape == (1, 7, 32)

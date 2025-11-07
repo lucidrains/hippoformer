@@ -221,6 +221,122 @@ class PathIntegration(Module):
 
         return self.rnn(transitions, prev_structural)
 
+# custom transformer
+# with the connections proposed by James Whittington that bridges to hippocampal models
+# https://arxiv.org/abs/2112.04035
+
+def FeedForward(dim, mult = 4.):
+    dim_inner = int(dim * mult)
+    return nn.Sequential(
+        nn.Linear(dim, dim_inner),
+        nn.GELU(),
+        nn.Linear(dim_inner, dim)
+    )
+
+class Attention(Module):
+    def __init__(
+        self,
+        dim_q,
+        dim_kv,
+        dim_head = 64,
+        heads = 8
+    ):
+        super().__init__()
+        dim_inner = dim_head * heads
+        self.scale = dim_head ** -0.5
+
+        self.to_queries = nn.Linear(dim_q, dim_inner, bias = False)
+        self.to_key_values = nn.Linear(dim_kv, dim_inner * 2, bias = False)
+
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.to_out = nn.Linear(dim_inner, dim_q, bias = False)
+        self.attn_head_sink = nn.Parameter(torch.randn(heads) * 1e-2) # needed as the diagonal is masked out, and for attention sink
+
+    def forward(
+        self,
+        queries_input,
+        key_values_input,
+        kv_cache = None
+    ):
+        batch, seq_len, device = *queries_input.shape[:2], queries_input.device
+
+        q = self.to_queries(queries_input)
+
+        k, v = self.to_key_values(key_values_input).chunk(2, dim = -1)
+
+        q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
+
+        if exists(kv_cache):
+            ck, cv = kv_cache
+            k = cat((ck, k), dim = -2)
+            v = cat((cv, v), dim = -2)
+
+        q = q * self.scale
+
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        # the diagonal is masked out
+
+        i, j = sim.shape[-2:]
+        causal_mask_without_diagonal = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i)
+
+        sim = sim.masked_fill(causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
+
+        # attention sink, for token as well as for attention sinking - from gpt-oss
+
+        attn_sink = repeat(self.attn_head_sink, 'h -> b h i 1', b = batch, i = seq_len)
+
+        sim = cat((attn_sink, sim), dim = -1)
+
+        attn = sim.softmax(dim = -1)
+
+        attn = attn[..., 1:] # remove sink
+
+        # aggregate
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        out = self.merge_heads(out)
+
+        return self.to_out(out), stack((k, v))
+
+class TEMTransformerBlock(Module):
+    def __init__(
+        self,
+        dim_structure,
+        dim_encoded_sensory,
+        dim_head = 64,
+        heads = 8,
+        ff_expansion_factor = 4.,
+        window_size = 64
+    ):
+        super().__init__()
+
+        self.attn = Attention(dim_structure, dim_structure + dim_encoded_sensory, dim_head = dim_head, heads = heads)
+        self.ff = FeedForward(dim_structure, ff_expansion_factor)
+
+        self.window_size = window_size
+
+    def forward(
+        self,
+        structural_codes,
+        encoded_sensory,
+        kv_cache = None
+    ):
+        structure_and_sensory = cat((structural_codes, encoded_sensory), dim = -1)
+
+        retrieved, next_kv_cache = self.attn(structural_codes, structure_and_sensory, kv_cache = kv_cache)
+
+        x = retrieved + structural_codes
+
+        x = self.ff(x) + x
+
+        next_kv_cache = next_kv_cache[:, -self.window_size:]
+
+        return x, next_kv_cache
+
 # proposed mmTEM
 
 class mmTEM(Module):
