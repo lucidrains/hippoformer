@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn, Tensor, cat, stack, arange, zeros_like, einsum, tensor
 import torch.nn.functional as F
-from torch.nn import Module
+from torch.nn import Module, ModuleList
 from torch.jit import ScriptModule, script_method
 from torch.func import vmap, grad, functional_call
 
@@ -346,6 +346,66 @@ class TEMTransformerBlock(Module):
         next_kv_cache = next_kv_cache[:, -self.window_size:]
 
         return x, next_kv_cache
+
+class TEMTransformer(Module):
+    def __init__(
+        self,
+        sensory_encoder_decoder: tuple[Module, Module],
+        dim_sensory,
+        dim_action,
+        dim_encoded_sensory,
+        dim_structure,
+        depth = 4,
+        transformer_kwargs: dict = dict(
+            dim_head = 64,
+            heads = 8,
+            ff_expansion_factor = 4,
+            window_size = 32
+        ),
+    ):
+        super().__init__()
+
+        self.sensory_encoder, self.sensory_decoder = sensory_encoder_decoder
+
+        self.path_integrator = nn.GRU(dim_action, dim_structure)
+
+        self.layers = ModuleList([])
+
+        for _ in range(depth):
+
+            block = TEMTransformerBlock(
+                dim_structure,
+                dim_encoded_sensory,
+                **transformer_kwargs
+            )
+
+            layers.append(block)
+
+    def forward(
+        self,
+        sensory,
+        actions,
+        prev_hiddens = None,  # for the GRU based path integrator
+        prev_kv_cache = None  # for the specialized transformer blocks for inducing the grid-cells
+    ):
+        
+        structure, next_hiddens = self.gru_path_integrator(actions, prev_hiddens)
+
+        encoded_sensory = self.sensory_encoder(sensory)
+
+        next_kv_cache = []
+
+        for layer in self.layers:
+            structure, layer_next_cache = layer(structure, encoded_sensory)
+            next_kv_cache.append(layer_next_cache)
+
+        decoded_sensory = self.sensory_decoder(structure)
+
+        next_memories = (next_hiddens, stack(next_kv_cache))
+
+        pred_loss = F.mse_loss(encoded_sensory, decoded_sensory)
+
+        return pred_loss
 
 # proposed mmTEM
 
