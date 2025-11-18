@@ -244,13 +244,23 @@ class Attention(Module):
         window_size,
         dim_head = 64,
         heads = 8,
+        implicit_mlp_expansion = 2 # for fair comparison, the attention should have an implicit mlp of 2 layers with a non-linearity, just like the meta-memory mlp in titans (linear attention)
     ):
         super().__init__()
         dim_inner = dim_head * heads
+        dim_mlp_inner = dim_head * heads * implicit_mlp_expansion
+
         self.scale = dim_head ** -0.5
 
         self.to_queries = nn.Linear(dim_q, dim_inner, bias = False)
-        self.to_key_values = nn.Linear(dim_kv, dim_inner * 2, bias = False)
+
+        self.to_w1_keys = nn.Linear(dim_kv, dim_inner, bias = False)
+        self.to_w1_values = nn.Linear(dim_kv, dim_mlp_inner, bias = False)
+
+        self.implicit_mlp_activation = nn.SiLU()
+
+        self.to_w2_keys = nn.Linear(dim_kv, dim_mlp_inner, bias = False)
+        self.to_w2_values = nn.Linear(dim_kv, dim_inner, bias = False)
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -270,47 +280,59 @@ class Attention(Module):
 
         q = self.to_queries(queries_input)
 
-        k, v = self.to_key_values(key_values_input).chunk(2, dim = -1)
+        k1, v1, k2, v2 = [fn(key_values_input) for fn in (self.to_w1_keys, self.to_w1_values, self.to_w2_keys, self.to_w2_values)]
 
-        q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
+        q, k1, v1, k2, v2 = tuple(self.split_heads(t) for t in (q, k1, v1, k2, v2))
 
         if exists(kv_cache):
-            ck, cv = kv_cache
-            k = cat((ck, k), dim = -2)
-            v = cat((cv, v), dim = -2)
+            ck1, cv1, vk2, cv2 = kv_cache
+            k1 = cat((ck1, k1), dim = -2)
+            v1 = cat((cv1, v1), dim = -2)
+            k2 = cat((ck2, k2), dim = -2)
+            v2 = cat((cv2, v2), dim = -2)
 
-        q = q * self.scale
+        def attend(q, k, v):
+            q = q * self.scale
 
-        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+            sim = einsum('b h i d, b h j d -> b h i j', q, k)
 
-        # the diagonal is masked out
+            # the diagonal is masked out
 
-        i, j = sim.shape[-2:]
+            i, j = sim.shape[-2:]
 
-        j_seq = arange(j, device = device)[:, None]
-        i_seq = arange(i, device = device)[None, :] + (j - i)
+            j_seq = arange(j, device = device)[:, None]
+            i_seq = arange(i, device = device)[None, :] + (j - i)
 
-        windowed_causal_mask_without_diagonal = (i_seq > j_seq) & ((i_seq - j_seq) <= self.window_size)
+            windowed_causal_mask_without_diagonal = (i_seq > j_seq) & ((i_seq - j_seq) <= self.window_size)
 
-        sim = sim.masked_fill(windowed_causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(windowed_causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
 
-        # attention sink, for token as well as for attention sinking - from gpt-oss
+            # attention sink, for token as well as for attention sinking - from gpt-oss
 
-        attn_sink = repeat(self.attn_head_sink, 'h -> b h i 1', b = batch, i = seq_len)
+            attn_sink = repeat(self.attn_head_sink, 'h -> b h i 1', b = batch, i = seq_len)
 
-        sim = cat((attn_sink, sim), dim = -1)
+            sim = cat((attn_sink, sim), dim = -1)
 
-        attn = sim.softmax(dim = -1)
+            attn = sim.softmax(dim = -1)
 
-        attn = attn[..., 1:] # remove sink
+            attn = attn[..., 1:] # remove sink
 
-        # aggregate
+            # aggregate
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+            out = einsum('b h i j, b h j d -> b h i d', attn, v)
+            return out
+
+        # implicit memory mlp w1
+
+        hiddens = attend(q, k1, v1)
+        hiddens = self.implicit_mlp_activation(hiddens)
+        out = attend(hiddens, k2, v2)
+
+        # merge heads
 
         out = self.merge_heads(out)
 
-        return self.to_out(out), stack((k, v))
+        return self.to_out(out), (k1, v1, k2, v2)
 
 class TEMTransformerBlock(Module):
     def __init__(
@@ -343,7 +365,7 @@ class TEMTransformerBlock(Module):
 
         x = self.ff(x) + x
 
-        next_kv_cache = next_kv_cache[:, -self.window_size:]
+        next_kv_cache = tuple(t[:, -self.window_size:] for t in next_kv_cache)
 
         return x, next_kv_cache
 
