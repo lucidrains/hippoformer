@@ -285,7 +285,7 @@ class Attention(Module):
         q, k1, v1, k2, v2 = tuple(self.split_heads(t) for t in (q, k1, v1, k2, v2))
 
         if exists(kv_cache):
-            ck1, cv1, vk2, cv2 = kv_cache
+            ck1, cv1, ck2, cv2 = kv_cache
             k1 = cat((ck1, k1), dim = -2)
             v1 = cat((cv1, v1), dim = -2)
             k2 = cat((ck2, k2), dim = -2)
@@ -300,12 +300,12 @@ class Attention(Module):
 
             i, j = sim.shape[-2:]
 
-            j_seq = arange(j, device = device)[:, None]
-            i_seq = arange(i, device = device)[None, :] + (j - i)
+            i_seq = arange(i, device = device)[:, None] + (j - i)
+            j_seq = arange(j, device = device)[None, :]
 
             windowed_causal_mask_without_diagonal = (i_seq > j_seq) & ((i_seq - j_seq) <= self.window_size)
 
-            sim = sim.masked_fill(windowed_causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(~windowed_causal_mask_without_diagonal, -torch.finfo(sim.dtype).max)
 
             # attention sink, for token as well as for attention sinking - from gpt-oss
 
@@ -401,24 +401,28 @@ class TEMTransformer(Module):
                 **transformer_kwargs
             )
 
-            layers.append(block)
+            self.layers.append(block)
 
     def forward(
         self,
         sensory,
         actions,
-        prev_hiddens = None,  # for the GRU based path integrator
-        prev_kv_cache = None  # for the specialized transformer blocks for inducing the grid-cells
+        prev_hiddens = None,   # for the GRU based path integrator
+        prev_kv_cache = None,  # for the specialized transformer blocks for inducing the grid-cells
+        return_memories = False
     ):
         
-        structure, next_hiddens = self.gru_path_integrator(actions, prev_hiddens)
+        structure, next_hiddens = self.path_integrator(actions, prev_hiddens)
 
         encoded_sensory = self.sensory_encoder(sensory)
+
+        prev_kv_cache = default(prev_kv_cache, (None,) * len(self.layers))
+        iter_prev_kv_cache = iter(prev_kv_cache)
 
         next_kv_cache = []
 
         for layer in self.layers:
-            structure, layer_next_cache = layer(structure, encoded_sensory)
+            structure, layer_next_cache = layer(structure, encoded_sensory, kv_cache = next(iter_prev_kv_cache, None))
             next_kv_cache.append(layer_next_cache)
 
         decoded_sensory = self.sensory_decoder(structure)
@@ -427,7 +431,10 @@ class TEMTransformer(Module):
 
         pred_loss = F.mse_loss(encoded_sensory, decoded_sensory)
 
-        return pred_loss
+        if not return_memories:
+            return pred_loss
+
+        return pred_loss, next_memories
 
 # proposed mmTEM
 
@@ -484,7 +491,7 @@ class mmTEM(Module):
         self.to_values = nn.Linear(dim_joint_rep, dim, bias = False)
 
         self.to_learned_optim_hparams = nn.Linear(dim_joint_rep, 3, bias = False) # for learning rate, forget gate, and momentum
-        self.assoc_scan = AssocScan(*assoc_scan_kwargs)
+        self.assoc_scan = AssocScan(**assoc_scan_kwargs)
 
         self.meta_memory_mlp = create_mlp(
             dim = dim * 2,
@@ -495,7 +502,7 @@ class mmTEM(Module):
         )
 
         def forward_with_mse_loss(params, keys, values):
-            pred = functional_call(self.meta_memory_mlp, params, keys)
+            pred = functional_call(self.meta_memory_mlp, params, (keys,))
             return F.mse_loss(pred, values)
 
         grad_fn = grad(forward_with_mse_loss)
@@ -596,7 +603,7 @@ class mmTEM(Module):
 
         # 2b. structure from structure
 
-        decoded_structure, decoded_encoded_sensory = self.retrieve(zeros_like(structural_codes), encoded_sensory)
+        decoded_structure, decoded_encoded_sensory = self.retrieve(structural_codes, zeros_like(encoded_sensory))
 
         structure_from_structure_loss = F.mse_loss(decoded_structure, structural_codes)
 
