@@ -51,7 +51,6 @@ def test_mm_tem(
     model = mmTEM(
         dim = 32,
         sensory_encoder_decoder = enc_dec,
-        dim_sensory = 11,
         dim_action = 7,
         dim_structure = 32,
         dim_encoded_sensory = 32,

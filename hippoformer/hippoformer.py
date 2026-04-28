@@ -240,7 +240,8 @@ class Attention(Module):
     def __init__(
         self,
         dim_q,
-        dim_kv,
+        dim_k,
+        dim_v,
         window_size,
         dim_head = 64,
         heads = 8,
@@ -254,13 +255,13 @@ class Attention(Module):
 
         self.to_queries = nn.Linear(dim_q, dim_inner, bias = False)
 
-        self.to_w1_keys = nn.Linear(dim_kv, dim_inner, bias = False)
-        self.to_w1_values = nn.Linear(dim_kv, dim_mlp_inner, bias = False)
+        self.to_w1_keys = nn.Linear(dim_k, dim_inner, bias = False)
+        self.to_w1_values = nn.Linear(dim_v, dim_mlp_inner, bias = False)
 
         self.implicit_mlp_activation = nn.SiLU()
 
-        self.to_w2_keys = nn.Linear(dim_kv, dim_mlp_inner, bias = False)
-        self.to_w2_values = nn.Linear(dim_kv, dim_inner, bias = False)
+        self.to_w2_keys = nn.Linear(dim_k, dim_mlp_inner, bias = False)
+        self.to_w2_values = nn.Linear(dim_v, dim_inner, bias = False)
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -273,14 +274,16 @@ class Attention(Module):
     def forward(
         self,
         queries_input,
-        key_values_input,
+        keys_input,
+        values_input,
         kv_cache = None
     ):
         batch, seq_len, device = *queries_input.shape[:2], queries_input.device
 
         q = self.to_queries(queries_input)
 
-        k1, v1, k2, v2 = [fn(key_values_input) for fn in (self.to_w1_keys, self.to_w1_values, self.to_w2_keys, self.to_w2_values)]
+        k1, k2 = [fn(keys_input) for fn in (self.to_w1_keys, self.to_w2_keys)]
+        v1, v2 = [fn(values_input) for fn in (self.to_w1_values, self.to_w2_values)]
 
         q, k1, v1, k2, v2 = tuple(self.split_heads(t) for t in (q, k1, v1, k2, v2))
 
@@ -346,7 +349,7 @@ class TEMTransformerBlock(Module):
     ):
         super().__init__()
 
-        self.attn = Attention(dim_structure, dim_structure + dim_encoded_sensory, window_size, dim_head = dim_head, heads = heads)
+        self.attn = Attention(dim_structure, dim_structure, dim_encoded_sensory, window_size, dim_head = dim_head, heads = heads)
         self.ff = FeedForward(dim_structure, ff_expansion_factor)
 
         self.window_size = window_size
@@ -357,9 +360,7 @@ class TEMTransformerBlock(Module):
         encoded_sensory,
         kv_cache = None
     ):
-        structure_and_sensory = cat((structural_codes, encoded_sensory), dim = -1)
-
-        retrieved, next_kv_cache = self.attn(structural_codes, structure_and_sensory, kv_cache = kv_cache)
+        retrieved, next_kv_cache = self.attn(structural_codes, structural_codes, encoded_sensory, kv_cache = kv_cache)
 
         x = retrieved + structural_codes
 
@@ -373,7 +374,6 @@ class TEMTransformer(Module):
     def __init__(
         self,
         sensory_encoder_decoder: tuple[Module, Module],
-        dim_sensory,
         dim_action,
         dim_encoded_sensory,
         dim_structure,
@@ -389,7 +389,7 @@ class TEMTransformer(Module):
 
         self.sensory_encoder, self.sensory_decoder = sensory_encoder_decoder
 
-        self.path_integrator = nn.GRU(dim_action, dim_structure)
+        self.path_integrator = nn.GRU(dim_action, dim_structure, batch_first = True)
 
         self.layers = ModuleList([])
 
@@ -427,9 +427,9 @@ class TEMTransformer(Module):
 
         decoded_sensory = self.sensory_decoder(structure)
 
-        next_memories = (next_hiddens, stack(next_kv_cache))
+        next_memories = (next_hiddens, tuple(next_kv_cache))
 
-        pred_loss = F.mse_loss(encoded_sensory, decoded_sensory)
+        pred_loss = F.mse_loss(sensory, decoded_sensory)
 
         if not return_memories:
             return pred_loss
@@ -445,7 +445,6 @@ class mmTEM(Module):
         dim,
         *,
         sensory_encoder_decoder: tuple[Module, Module],
-        dim_sensory,
         dim_action,
         dim_encoded_sensory,
         dim_structure,
@@ -597,33 +596,31 @@ class mmTEM(Module):
 
         # 2a. structure from content
 
-        decoded_structure, decoded_encoded_sensory = self.retrieve(zeros_like(structural_codes), encoded_sensory)
+        decoded_structure, _ = self.retrieve(zeros_like(structural_codes), encoded_sensory)
 
         structure_from_content_loss = F.mse_loss(decoded_structure, structural_codes)
 
         # 2b. structure from structure
 
-        decoded_structure, decoded_encoded_sensory = self.retrieve(structural_codes, zeros_like(encoded_sensory))
-
-        structure_from_structure_loss = F.mse_loss(decoded_structure, structural_codes)
+        structure_from_structure_loss = F.mse_loss(decoded_gen_structure, structural_codes)
 
         relational_loss = structure_from_content_loss + structure_from_structure_loss
 
         # 3. consistency - modeling a feedback system from hippocampus to path integration
 
-        corrected_structural_code, corrected_encoded_sensory = self.retrieve(decoded_gen_structure, encoded_sensory)
+        corrected_structural_code, corrected_encoded_sensory = self.retrieve(structural_codes, encoded_sensory)
 
         sensory_sse = (corrected_encoded_sensory - encoded_sensory).norm(dim = -1, keepdim = True).pow(2)
 
-        pred_variance = self.structure_variance_pred_mlp(cat((corrected_structural_code, decoded_gen_structure, sensory_sse), dim = -1))
+        pred_variance = self.structure_variance_pred_mlp((structural_codes, corrected_structural_code, sensory_sse))
 
-        inf_structural_code = decoded_gen_structure + (corrected_structural_code - decoded_gen_structure) * self.integration_ratio.sigmoid() * pred_variance
+        inf_structural_code = structural_codes + (corrected_structural_code - structural_codes) * self.integration_ratio.sigmoid() * pred_variance
 
-        consistency_loss = F.mse_loss(decoded_gen_structure, inf_structural_code)
+        consistency_loss = F.mse_loss(structural_codes, inf_structural_code)
 
         # 4. final inference loss
 
-        final_structural_code, inf_encoded_sensory = self.retrieve(inf_structural_code, zeros_like(encoded_sensory))
+        _, inf_encoded_sensory = self.retrieve(inf_structural_code, zeros_like(encoded_sensory))
 
         decoded_inf_sensory = self.sensory_decoder(inf_encoded_sensory)
 
@@ -631,7 +628,7 @@ class mmTEM(Module):
 
         # 5. store the final structural code from step 4 + encoded sensory
 
-        joint_code_to_store = cat((final_structural_code, encoded_sensory), dim = -1)
+        joint_code_to_store = cat((inf_structural_code, encoded_sensory), dim = -1)
 
         keys = self.to_keys(joint_code_to_store)
         values = self.to_values(joint_code_to_store)
@@ -677,7 +674,8 @@ class mmTEM(Module):
             # maybe muon
 
             if self.muon_update:
-                update = newtonschulz5(update)
+                update = newtonschulz5(inverse_pack(update))
+                update, _ = pack_with_inverse(update, 'b t *')
 
             # with forget gating
 
