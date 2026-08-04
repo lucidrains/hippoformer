@@ -25,6 +25,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def pack_with_inverse(t, pattern):
     packed, packed_shape = pack([t], pattern)
 
@@ -103,7 +106,6 @@ class EncoderPackTime(Module):
         x = self.fn(x)
 
         x, = unpack(x, packed_shape, '* d')
-        print(x.shape)
         return x
 
 class DecoderPackTime(Module):
@@ -240,14 +242,17 @@ class Attention(Module):
     def __init__(
         self,
         dim_q,
-        dim_k,
-        dim_v,
-        window_size,
+        dim_k = None,
+        dim_v = None,
+        window_size = 64,
+        dim_kv = None,
         dim_head = 64,
         heads = 8,
         implicit_mlp_expansion = 2 # for fair comparison, the attention should have an implicit mlp of 2 layers with a non-linearity, just like the meta-memory mlp in titans (linear attention)
     ):
         super().__init__()
+        dim_k = default(dim_k, dim_kv)
+        dim_v = default(dim_v, default(dim_kv, dim_q))
         dim_inner = dim_head * heads
         dim_mlp_inner = dim_head * heads * implicit_mlp_expansion
 
@@ -448,6 +453,7 @@ class mmTEM(Module):
         dim_action,
         dim_encoded_sensory,
         dim_structure,
+        dim_sensory = None,
         meta_mlp_depth = 2,
         decoder_mlp_depth = 2,
         structure_variance_pred_mlp_depth = 2,
@@ -471,6 +477,7 @@ class mmTEM(Module):
 
         dim_joint_rep = dim_encoded_sensory + dim_structure
 
+        self.dim_sensory = dim_sensory
         self.dim_encoded_sensory = dim_encoded_sensory
         self.dim_structure = dim_structure
         self.joint_dims = (dim_structure, dim_encoded_sensory)
@@ -712,3 +719,114 @@ class mmTEM(Module):
             return total_loss
 
         return total_loss, losses
+
+# hippoformer (parallel integration of mm-tem and transformer)
+
+class Hippoformer(Module):
+    @beartype
+    def __init__(
+        self,
+        dim,
+        *,
+        sensory_encoder_decoder: tuple[Module, Module],
+        dim_action,
+        dim_encoded_sensory,
+        dim_structure,
+        dim_sensory = None,
+        window_size = 64,
+        transformer_depth = 1,
+        mm_tem_kwargs: dict = dict(),
+        transformer_kwargs: dict = dict(),
+    ):
+        super().__init__()
+
+        self.mm_tem = mmTEM(
+            dim = dim,
+            sensory_encoder_decoder = sensory_encoder_decoder,
+            dim_action = dim_action,
+            dim_encoded_sensory = dim_encoded_sensory,
+            dim_structure = dim_structure,
+            **mm_tem_kwargs
+        )
+
+        self.dim_sensory = dim_sensory
+        self.sensory_encoder = self.mm_tem.sensory_encoder
+        self.sensory_decoder = self.mm_tem.sensory_decoder
+
+        dim_token = dim_encoded_sensory + dim_action
+
+        self.to_trans_input = nn.Linear(dim_token, dim_structure)
+        self.pos_emb = nn.Parameter(torch.randn(1, 1024, dim_token) * 0.02)
+
+        self.trans_layers = ModuleList([
+            TEMTransformerBlock(
+                dim_structure = dim_structure,
+                dim_encoded_sensory = dim_encoded_sensory,
+                window_size = window_size,
+                **transformer_kwargs
+            )
+            for _ in range(transformer_depth)
+        ])
+
+        self.integration_mlp = create_mlp(
+            dim = dim_structure * 2,
+            dim_in = dim_structure * 2,
+            dim_out = dim_encoded_sensory,
+            depth = 2,
+            activation = nn.ReLU()
+        )
+
+    def forward(
+        self,
+        sensory,
+        actions,
+        memory_mlp_params = None,
+        return_losses = False,
+        return_memory_mlp_params = False
+    ):
+        batch, seq_len = actions.shape[:2]
+
+        if return_memory_mlp_params:
+            return self.mm_tem(
+                sensory,
+                actions,
+                memory_mlp_params = memory_mlp_params,
+                return_memory_mlp_params = True
+            )
+
+        encoded_sensory = self.sensory_encoder(sensory)
+
+        # 1. mm-tem structural memory pathway
+
+        mm_tem_res = self.mm_tem(
+            sensory,
+            actions,
+            memory_mlp_params = memory_mlp_params,
+            return_losses = True
+        )
+        total_mm_tem_loss, mm_tem_losses = mm_tem_res
+
+        # 2. causal transformer working memory pathway
+
+        joint_input = cat((encoded_sensory, actions), dim = -1)
+        joint_input = joint_input + self.pos_emb[:, :seq_len]
+
+        trans_x = self.to_trans_input(joint_input)
+        for layer in self.trans_layers:
+            trans_x, _ = layer(trans_x, encoded_sensory)
+
+        # 3. parallel integration of mm-tem and transformer outputs
+
+        structural_codes = self.mm_tem.path_integrator(actions)
+        integrated_features = cat((structural_codes, trans_x), dim = -1)
+        decoded_encoded_sensory = self.integration_mlp(integrated_features)
+
+        integrated_sensory_pred = self.sensory_decoder(decoded_encoded_sensory)
+        hippo_pred_loss = F.mse_loss(sensory, integrated_sensory_pred)
+
+        total_loss = hippo_pred_loss + total_mm_tem_loss
+
+        if not return_losses:
+            return total_loss
+
+        return total_loss, (hippo_pred_loss, total_mm_tem_loss, *mm_tem_losses)

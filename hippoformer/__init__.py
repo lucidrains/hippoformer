@@ -1,4 +1,5 @@
 from hippoformer.hippoformer import (
     PathIntegration,
-    mmTEM
+    mmTEM,
+    Hippoformer
 )

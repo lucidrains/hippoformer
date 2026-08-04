@@ -3,6 +3,9 @@ param = pytest.mark.parametrize
 
 import torch
 
+def exists(v):
+    return v is not None
+
 def test_path_integrate():
     from hippoformer.hippoformer import PathIntegration
 
@@ -76,3 +79,22 @@ def test_tem_t():
     pred, kv_cache = block(structural_codes, encoded_sensory)
 
     assert pred.shape == (1, 7, 32)
+
+def test_hippoformer_model():
+    from hippoformer.hippoformer import Hippoformer
+    from torch.nn import Linear
+
+    sensory = torch.randn(2, 16, 11)
+    actions = torch.randn(2, 16, 7)
+
+    model = Hippoformer(
+        dim = 32,
+        sensory_encoder_decoder = (Linear(11, 32), Linear(32, 11)),
+        dim_action = 7,
+        dim_structure = 32,
+        dim_encoded_sensory = 32
+    )
+
+    loss = model(sensory, actions)
+    loss.backward()
+    assert exists(loss)
